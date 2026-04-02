@@ -697,8 +697,15 @@ def render_opentrons() -> None:
                 for text in stream.text_stream:
                     yield text
 
-        ot_code = st.write_stream(_stream())
-        ot_code = str(ot_code)
+        ot_code = str(st.write_stream(_stream()))
+
+        # Strip markdown code fences Claude sometimes adds (```python ... ```)
+        lines = ot_code.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        ot_code = "\n".join(lines)
 
         st.divider()
         col_dl, col_sim = st.columns(2)
@@ -712,13 +719,13 @@ def render_opentrons() -> None:
             )
         with col_sim:
             st.link_button(
-                "Open Opentrons Simulator",
-                "https://designer.opentrons.com",
+                "Open Opentrons App",
+                "https://opentrons.com/ot-app/",
             )
 
         st.caption(
-            "To test: open the Opentrons App, go to Protocol, upload the .py file. "
-            "Or paste into the Opentrons Protocol Designer simulator."
+            "Download the .py file, open the Opentrons App, click Import, and drop it in. "
+            "It will simulate without a robot connected."
         )
 
         render_save_export(ot_code, ptype="opentrons", key_prefix="ot")
