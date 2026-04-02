@@ -5,10 +5,14 @@ Features:
   2. Protocol Diff + Audit       — render_diff_auditor
   3. LabClaw / DB Search         — render_labclaw (UniProt, ChEMBL, PubChem via REST)
   4. Reagent Cost Estimator      — render_reagent_cost
+  5. My Protocols                — render_my_protocols
+  6. OpenTrons Export            — render_opentrons
+  7. Bench Vision                — render_bench_vision
 """
 
 from __future__ import annotations
 
+import base64
 import difflib
 import io
 import json
@@ -609,3 +613,234 @@ def render_my_protocols() -> None:
             if st.button("Delete", key=f"del_{row['id']}"):
                 db_delete_protocol(row["id"], user_id)
                 st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Feature 6 — OpenTrons Protocol Export
+# ---------------------------------------------------------------------------
+
+_OPENTRONS_SYSTEM = """\
+You are an expert Opentrons protocol engineer. Convert lab protocols into valid \
+Python scripts for the Opentrons OT-2 using protocol_api version 2.16.
+
+Rules:
+- Always include a metadata dict with protocolName, author, description, apiLevel '2.16'
+- Always define a run(protocol: protocol_api.ProtocolContext) function
+- Use only real Opentrons labware names (e.g. opentrons_96_tiprack_300ul,
+  corning_96_wellplate_360ul_flat, nest_12_reservoir_15ml,
+  opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap)
+- Use only real pipette names (p20_single_gen2, p300_single_gen2,
+  p1000_single_gen2, p20_multi_gen2, p300_multi_gen2)
+- Add comments mapping each OT-2 step to the original protocol step number
+- Where the protocol can't be fully automated, add a protocol.comment() call
+  explaining what the scientist needs to do manually
+- Output only the Python code, no explanation before or after
+"""
+
+
+def render_opentrons() -> None:
+    st.header("OpenTrons Protocol Export")
+    st.caption(
+        "Paste any lab protocol and BenchClaw will convert it into a valid "
+        "Python script for the Opentrons OT-2. Download and run it on the "
+        "robot or paste it into the Opentrons simulator."
+    )
+
+    col_input, col_options = st.columns([3, 1])
+
+    with col_input:
+        protocol_text = st.text_area(
+            "Protocol to convert",
+            height=280,
+            placeholder="Paste your protocol here...",
+            key="ot_protocol_input",
+        )
+
+    with col_options:
+        pipette_size = st.selectbox(
+            "Primary pipette",
+            ["p300_single_gen2", "p20_single_gen2", "p1000_single_gen2",
+             "p300_multi_gen2", "p20_multi_gen2"],
+            key="ot_pipette",
+        )
+        mount = st.selectbox("Mount", ["right", "left"], key="ot_mount")
+        robot = st.selectbox("Robot", ["OT-2", "Flex (coming soon)"], key="ot_robot")
+        st.caption(
+            "Tip: the more specific your protocol steps and volumes, "
+            "the more complete the generated code will be."
+        )
+
+    if st.button("Generate OT-2 Script", type="primary", key="ot_btn"):
+        if not protocol_text.strip():
+            st.warning("Please paste a protocol.")
+            return
+        if robot != "OT-2":
+            st.warning("Flex support coming soon. Generating OT-2 script.")
+
+        st.divider()
+        st.subheader("Generated OT-2 Script")
+
+        def _stream():
+            client = get_client()
+            with client.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                system=_OPENTRONS_SYSTEM,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Primary pipette: {pipette_size}, mount: {mount}\n\n"
+                        f"PROTOCOL:\n{protocol_text}"
+                    ),
+                }],
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+
+        ot_code = st.write_stream(_stream())
+        ot_code = str(ot_code)
+
+        st.divider()
+        col_dl, col_sim = st.columns(2)
+        with col_dl:
+            st.download_button(
+                "Download .py",
+                data=ot_code,
+                file_name="benchclaw_protocol.py",
+                mime="text/x-python",
+                key="ot_download",
+            )
+        with col_sim:
+            st.link_button(
+                "Open Opentrons Simulator",
+                "https://designer.opentrons.com",
+            )
+
+        st.caption(
+            "To test: open the Opentrons App, go to Protocol, upload the .py file. "
+            "Or paste into the Opentrons Protocol Designer simulator."
+        )
+
+        render_save_export(ot_code, ptype="opentrons", key_prefix="ot")
+
+
+# ---------------------------------------------------------------------------
+# Feature 7 — Bench Vision (image upload + Claude vision)
+# ---------------------------------------------------------------------------
+
+_VISION_SYSTEM = """\
+You are an expert lab scientist analyzing images from a biology research bench. \
+When shown a lab image, you:
+1. Describe exactly what you see (equipment, samples, reagents, labels, results)
+2. Identify the likely experiment or technique being performed
+3. Flag any visible issues: contamination, incorrect technique, mislabeled tubes,
+   unusual gel bands, unhealthy cells, incorrect color reactions, safety concerns
+4. If a protocol context is provided, note which step this image likely corresponds to
+   and whether what you see matches expectations
+
+Be specific and scientific. If you can read labels or text in the image, do so.
+"""
+
+_VISION_CATEGORIES = [
+    "General lab photo",
+    "Gel electrophoresis",
+    "Cell culture / microscopy",
+    "Western blot",
+    "PCR / qPCR setup",
+    "Reagent / tube labeling",
+    "Lab notebook page",
+    "Equipment / instrument",
+    "Plate reader / assay",
+    "Other",
+]
+
+
+def render_bench_vision() -> None:
+    st.header("Bench Vision")
+    st.caption(
+        "Upload a photo from the bench. Claude will describe what it sees, "
+        "identify the technique, and flag any issues. Optionally provide a "
+        "protocol for context."
+    )
+
+    col_upload, col_context = st.columns([1, 1])
+
+    with col_upload:
+        uploaded = st.file_uploader(
+            "Upload bench photo",
+            type=["jpg", "jpeg", "png", "gif", "webp"],
+            key="vision_upload",
+        )
+        if uploaded:
+            st.image(uploaded, use_container_width=True)
+
+        image_type = st.selectbox(
+            "What kind of image is this?",
+            _VISION_CATEGORIES,
+            key="vision_category",
+        )
+
+    with col_context:
+        protocol_context = st.text_area(
+            "Protocol context (optional)",
+            height=200,
+            placeholder=(
+                "Paste the relevant protocol or describe what step you're on. "
+                "This helps Claude interpret the image more accurately."
+            ),
+            key="vision_protocol_context",
+        )
+        question = st.text_input(
+            "Specific question (optional)",
+            placeholder="e.g. Do these bands look right? Is this contaminated?",
+            key="vision_question",
+        )
+
+    if st.button("Analyze Image", type="primary", key="vision_btn"):
+        if not uploaded:
+            st.warning("Please upload an image.")
+            return
+
+        uploaded.seek(0)
+        image_bytes = uploaded.read()
+        b64 = base64.standard_b64encode(image_bytes).decode()
+
+        ext = uploaded.name.rsplit(".", 1)[-1].lower()
+        media_type_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+        }
+        media_type = media_type_map.get(ext, "image/jpeg")
+
+        user_content: list = [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64},
+            },
+        ]
+
+        prompt_parts = [f"Image type: {image_type}"]
+        if protocol_context.strip():
+            prompt_parts.append(f"Protocol context:\n{protocol_context.strip()}")
+        if question.strip():
+            prompt_parts.append(f"Specific question: {question.strip()}")
+        prompt_parts.append("Please analyze this lab image.")
+
+        user_content.append({"type": "text", "text": "\n\n".join(prompt_parts)})
+
+        st.divider()
+        st.subheader("Analysis")
+
+        def _stream():
+            client = get_client()
+            with client.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=2048,
+                system=_VISION_SYSTEM,
+                messages=[{"role": "user", "content": user_content}],
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+
+        analysis = st.write_stream(_stream())
+        render_save_export(str(analysis), ptype="vision_analysis", key_prefix="vision")

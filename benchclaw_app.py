@@ -13,9 +13,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "labclaw", "src"))
 from benchclaw_db import db_create_user, db_load_by_token, db_verify_user
 from benchclaw_features import (
     get_client,
+    render_bench_vision,
     render_diff_auditor,
     render_labclaw,
     render_my_protocols,
+    render_opentrons,
     render_reagent_cost,
     render_save_export,
 )
@@ -473,6 +475,8 @@ def main() -> None:
                 "Protocol Diff & Audit",
                 "Database Search",
                 "Reagent Cost Estimator",
+                "OpenTrons Export",
+                "Bench Vision",
                 "My Protocols",
             ],
             label_visibility="collapsed",
@@ -500,6 +504,10 @@ def main() -> None:
         render_labclaw()
     elif page == "Reagent Cost Estimator":
         render_reagent_cost()
+    elif page == "OpenTrons Export":
+        render_opentrons()
+    elif page == "Bench Vision":
+        render_bench_vision()
     elif page == "My Protocols":
         render_my_protocols()
 
