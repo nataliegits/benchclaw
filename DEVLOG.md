@@ -1,132 +1,175 @@
 # BenchClaw Devlog
 
-## 2026-04-01 — Building v2
+---
+
+## 2026-04-01 — Building v1 and v2 in one session
+
+### What I set out to do
+
+I wanted to build a tool that could audit lab protocols using AI. The longer vision is BenchClaw as a wearable lab capture system — something that passively records what scientists do at the bench and writes structured protocol documentation in real time. Today was about building the software intelligence layer: take a protocol, understand it, critique it, generate new ones, find related literature. The hardware comes later. Eventually I want to feed it images — photos or video from the bench — and have it make sense of what's happening visually.
 
 ---
 
-### What is LabClaw?
+### What I actually built
 
-[LabClaw](./labclaw/) is an open-source Python library that acts as a unified gateway to 2400+ scientific tools. It gives scientists and developers a single interface to query databases like PubMed, UniProt, ChEMBL, PubChem, OpenTargets, ClinicalTrials, and more — all through one Python SDK, REST API, CLI, or MCP server (for Claude Desktop).
+**v1** was a ~70-line command-line script. You run it in a terminal, give it a protocol, it calls Claude, and prints an audit report. Simple.
 
-Under the hood LabClaw has three main skills:
+**v2** is a full web app with seven tools:
 
-| Skill | What it does |
+| Tool | What it does |
 |---|---|
-| `tooluniverse` | Wraps the [ToolUniverse](https://github.com/mims-harvard/ToolUniverse) SDK — 2000+ scientific database tools |
-| `lifesci` | Life science domain reasoning via an LLM (experiment design, biological Q&A) |
-| `write` | Scientific writing assistance (methods sections, abstracts, etc.) |
+| Protocol Auditor | Paste a protocol, get an expert AI critique |
+| Literature Cross-Reference | Auto-search PubMed for papers relevant to your protocol |
+| Protocol Generator | Describe an experiment in plain English, get a full protocol |
+| Protocol Diff & Audit | Paste two versions of a protocol, see what changed, audit the delta |
+| Database Search | Search UniProt (proteins), ChEMBL (molecules), PubChem (compounds) |
+| Reagent Cost Estimator | Extract reagents from a protocol, get price ranges and vendors |
+| My Protocols | Save, share, and manage protocols across sessions |
 
-It exposes all of this through a FastAPI REST server on port 18802, an MCP server for Claude Desktop, and a Python SDK (`from labclaw.brain import execute, reason, write`).
+The whole thing runs locally. Auth, database, sharing — all local, no cloud service required.
 
 ---
 
-### What is the Anthropic SDK?
+### The thing that surprised me most
 
-The [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) (`pip install anthropic`) is the official client library for the Claude API. It lets you:
+Everything was faster to build than expected. The concepts sound complicated — streaming AI responses, database search, user authentication — but the actual code for each was short. The Anthropic SDK does a lot of the heavy lifting. Streamlit does the same for the UI. Most of the work was figuring out *what* to build, not *how*.
 
-- Send messages to Claude models (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`)
-- Stream responses token-by-token with `client.messages.stream()`
-- Use tool calling, structured outputs, vision, and extended thinking
-- Access the Batches API (async, 50% cheaper) and Files API
+The one rough patch was LabClaw. It took a while to get set up and even then we couldn't fully use it in the app (more on why below). That was frustrating because it should have been the easy part.
 
-The core pattern is:
+---
+
+### Concepts I used — explained simply
+
+I used a bunch of tools and concepts I hadn't worked with before. Here's what they actually are:
+
+---
+
+#### The Anthropic SDK
+
+The Anthropic SDK is a Python library (`pip install anthropic`) that lets you send messages to Claude and get responses back. 
+
+Think of it like a phone call to Claude. You write your message, you call a function, you get a response. Under the hood it's making HTTP requests to Anthropic's servers — the SDK just makes that invisible so you don't have to deal with it.
+
+The simplest version looks like this:
 
 ```python
 import anthropic
 
-client = anthropic.Anthropic(api_key="...")
+client = anthropic.Anthropic(api_key="your-key")
 
 response = client.messages.create(
     model="claude-opus-4-6",
     max_tokens=2048,
-    system="You are a helpful scientist.",
-    messages=[{"role": "user", "content": "Explain CRISPR."}]
+    messages=[{"role": "user", "content": "Audit this protocol..."}]
 )
+
 print(response.content[0].text)
 ```
 
-For streaming (so output appears in real time):
+Three things to know:
+- **`model`** — which version of Claude to use. I used `claude-opus-4-6`, the most capable one.
+- **`max_tokens`** — how long the response is allowed to be. A token is roughly one word.
+- **`messages`** — the conversation history. The API is stateless, meaning it doesn't remember previous conversations, so you send the whole history every time.
+
+There's also a `system` parameter that sets Claude's persona/instructions before the conversation starts. That's how you tell it "you are a senior molecular biologist" — it shapes every response after that.
+
+---
+
+#### Streaming
+
+When you call an API normally, you wait for the entire response before you see anything. If Claude is writing a 500-word protocol audit, you stare at a blank screen for 10 seconds and then the whole thing appears at once.
+
+Streaming changes that. Instead of waiting for the whole response, you receive it word by word as it's being written — exactly like watching someone type in real time. The user sees output immediately, and long responses don't feel like they're hanging.
+
+In code, instead of `client.messages.create()`, you use `client.messages.stream()` with a context manager:
 
 ```python
-with client.messages.stream(model="claude-opus-4-6", max_tokens=4096, messages=[...]) as stream:
+with client.messages.stream(model="claude-opus-4-6", ...) as stream:
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
 
+In Streamlit specifically, there's a function called `st.write_stream()` that handles all of this — you give it a generator that yields text chunks, and Streamlit renders them live on the page.
+
+Streaming is almost always the right choice for AI responses. It makes the app feel faster even when it isn't, and it prevents timeouts on long responses.
+
 ---
 
-### BenchClaw v1 — The CLI Auditor
+#### Streamlit
 
-`benchclaw.py` is a minimal command-line tool that audits a lab protocol using Claude. You run it like:
+Streamlit is a Python library that turns a Python script into a web app — no HTML, no CSS, no JavaScript required.
 
-```bash
-python benchclaw.py --protocol my_protocol.txt --output report.md
+Normally building a web app means writing frontend code (what the user sees) separately from backend code (the logic). Streamlit collapses that into one Python file. You write `st.text_area("Paste your protocol")` and it becomes a text input on a webpage. `st.button("Audit")` becomes a clickable button. `st.write(result)` renders the output.
+
+Every time a user interacts with the page — clicks a button, types in a box — Streamlit reruns your entire Python script from top to bottom. That's a weird mental model at first (it's not how normal web apps work) but it means the UI always reflects the current state of your code.
+
+`st.session_state` is how you persist information across those reruns — it's a dictionary that survives the rerun cycle. That's how auth works: after login, we store `st.session_state["logged_in"] = True`, so when the script reruns it knows the user is still logged in.
+
+---
+
+#### REST APIs
+
+REST APIs are how most databases and services expose their data over the internet. You send a request to a URL with some parameters, you get structured data (usually JSON) back.
+
+Example — searching PubMed for papers about MeDIP-seq:
+
+```
+GET https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
+    ?db=pubmed&term="MeDIP-seq"&retmax=5&retmode=json
 ```
 
-It sends the protocol text to `claude-sonnet-4-6` with a system prompt written as a senior molecular biologist, asks it to flag missing steps, safety concerns, QC issues, parameter problems, and improvements, then prints the report and optionally saves it as Markdown.
+That returns a list of PubMed IDs. You then make a second call to fetch the actual paper details. No special library needed — just `requests.get(url, params={...})` in Python.
 
-**What v1 is:**
-- ~70 lines of Python
-- Single function: `audit_protocol(text) -> str`
-- CLI only, no UI
-- One feature (auditing)
-- Synchronous API call, no streaming
+NCBI (PubMed), UniProt, ChEMBL, and PubChem all have free REST APIs that don't require API keys for basic use. That's how the Database Search and Literature Cross-Reference features work — direct HTTP calls, no intermediary.
 
 ---
 
-### BenchClaw v2 — The Streamlit Web App
+#### SQLite
 
-`benchclaw_app.py` is a full Streamlit web app with three tools, all accessible from a sidebar navigation menu.
+SQLite is a database that lives in a single file on your computer. No server to set up, no credentials, no configuration. You just open the file and start storing data.
 
-#### Feature 1: Protocol Auditor
+It's used in BenchClaw for two things: storing user accounts (username, salted password hash) and storing saved protocols with share tokens. The database file is called `benchclaw.db` and gets created automatically when the app starts.
 
-Same core idea as v1 but with a web UI and streaming output. The user pastes a protocol into a text area, hits "Audit Protocol", and the Claude audit streams to the page in real time. Upgraded to `claude-opus-4-6` (the most capable model).
-
-#### Feature 2: Literature Cross-Reference
-
-New feature. The user pastes a protocol or describes an experiment. The app:
-1. Sends the text to Claude to extract 3–6 relevant PubMed search terms (returns JSON)
-2. Queries the [NCBI E-utilities API](https://www.ncbi.nlm.nih.gov/home/develop/api/) (free, no key required) with those terms
-3. Fetches full paper records (title, authors, journal, year, abstract, PMID)
-4. Displays expandable paper cards with links to PubMed
-
-This is where LabClaw comes in — the `labclaw/src` path is added to `sys.path` so the app can access LabClaw internals, and the PubMed search uses the same NCBI E-utilities endpoints that LabClaw's `search_pubmed` tool wraps.
-
-#### Feature 3: Protocol Generator
-
-New feature. The user describes an experiment in plain English (e.g. "I want to knock out DNMT3A with CRISPR in HEK293 cells and measure methylation changes") and the app generates a complete, structured lab protocol. Options for detail level (standard, Nature Protocols–style, quick overview) and output format (numbered list, Markdown sections, step table). Streams in real time.
+The reason to use a database rather than, say, a text file or JSON file is that it handles concurrent access safely (multiple reruns of the Streamlit script all hitting the same data without corrupting it) and lets you query by specific fields like a token or user ID.
 
 ---
 
-### v1 vs v2 Comparison
+#### Why we couldn't use LabClaw's brain module directly
 
-| | v1 | v2 |
-|---|---|---|
-| Interface | CLI | Streamlit web app |
-| Features | Protocol audit only | Audit + Literature search + Protocol generation |
-| Model | `claude-sonnet-4-6` | `claude-opus-4-6` |
-| Streaming | No | Yes (real-time output) |
-| PubMed integration | No | Yes (NCBI E-utilities + Claude keyword extraction) |
-| Lines of code | ~70 | ~430 |
+LabClaw has a `brain` module that wraps all the scientific database tools (including PubMed search, protein lookup, etc.). I wanted to use it directly in the app. It didn't work.
+
+The reason: LabClaw's code uses a Python feature called `StrEnum` — a type of enum that's also a string. `StrEnum` was added to Python's standard library in **Python 3.11**. The Python version running the app is **3.9**. When the app tried to import `labclaw.brain`, Python hit that line and crashed immediately.
+
+The fix was to call the underlying databases directly via their REST APIs — which is exactly what LabClaw's wrappers do internally anyway. Same data, one less layer. It works fine, but it means the app isn't using LabClaw the way it was designed to be used. That's something to fix properly once we're on Python 3.11+.
 
 ---
 
-### How to Run
+### Architecture decisions
 
-```bash
-cd ~/Desktop/benchclaw
-ANTHROPIC_API_KEY="sk-ant-..." /Users/nataliechen/Library/Python/3.9/bin/streamlit run benchclaw_app.py
-```
+**Why three files instead of one?**
 
-Opens at `http://localhost:8501`.
+The app started as one file (`benchclaw_app.py`). Once we added six more features, it would have grown to ~900 lines in one place. We split it into:
+
+- `benchclaw_app.py` — routing, auth gate, the original three features
+- `benchclaw_features.py` — all six new features and export helpers
+- `benchclaw_db.py` — all database operations (user accounts, protocol saving)
+
+The principle: separate things by *what changes together*. Auth logic and database schema change for different reasons than UI features. Keeping them separate makes each file easier to read and modify.
+
+**Why no external auth library?**
+
+User authentication libraries add dependencies and opinions about how auth should work. For a local tool, the stdlib is enough: `hashlib` for hashing, `secrets` for generating random salts and tokens, `sqlite3` for storing it all. The passwords are salted before hashing, which means even if someone got the database file, they couldn't reverse the passwords.
+
+**Why are shared protocol links accessible without login?**
+
+Intentional. If you generate a protocol and want to send it to a colleague, they shouldn't have to create an account to read it. The share link is a random 16-character URL-safe token (`secrets.token_urlsafe(12)`). Knowing the token is enough to view the protocol — the same model GitHub uses for secret gists.
 
 ---
 
-### Roadmap
+### What's next
 
-- [ ] Export audit reports and generated protocols as `.docx` / `.pdf`
-- [ ] Protocol versioning — diff two protocols and audit the delta
-- [ ] LabClaw deep integration — use `tooluniverse` skill to query UniProt, ChEMBL, PubChem directly from the UI
-- [ ] Reagent cost estimator — parse a protocol and look up reagent prices
-- [ ] Protocol sharing — save and share protocols via a short link
-- [ ] Auth — add user accounts so researchers can save their history
+The intelligence layer for images. The end goal is: you take a photo or video at the bench, feed it to the app, and BenchClaw understands what's happening — what reagent is in that tube, what step you're on, what the gel looks like, whether the cell morphology looks right. 
+
+Claude already supports image input (vision). The groundwork is the protocol and database layer we built today — once the app understands what a correct protocol *looks like*, it has a baseline to compare visual observations against. That's the connection between what we built today and the hardware vision.
+
+The next concrete step is building an image upload interface and prompting Claude to interpret bench photos in the context of a specific protocol.
