@@ -801,8 +801,35 @@ def render_bench_vision() -> None:
             st.warning("Please upload an image.")
             return
 
+        # Resize to max 1568px on longest side before encoding.
+        # Large photos (e.g. 4K iPhone shots) can exceed request limits and
+        # cause connection errors. Anthropic recommends staying under 1568px.
         uploaded.seek(0)
-        image_bytes = uploaded.read()
+        raw_bytes = uploaded.read()
+
+        try:
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(raw_bytes))
+            max_dim = 1568
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim), PILImage.LANCZOS)
+                buf = io.BytesIO()
+                fmt = img.format or "JPEG"
+                if fmt.upper() == "GIF":
+                    fmt = "PNG"
+                img.save(buf, format=fmt)
+                image_bytes = buf.getvalue()
+                st.caption(f"Image resized to {img.size[0]}x{img.size[1]}px before analysis.")
+            else:
+                image_bytes = raw_bytes
+        except Exception:
+            image_bytes = raw_bytes
+
+        size_mb = len(image_bytes) / (1024 * 1024)
+        if size_mb > 4.5:
+            st.error(f"Image is {size_mb:.1f} MB after resizing — too large to send. Try a smaller image.")
+            return
+
         b64 = base64.standard_b64encode(image_bytes).decode()
 
         ext = uploaded.name.rsplit(".", 1)[-1].lower()
@@ -842,5 +869,8 @@ def render_bench_vision() -> None:
                 for text in stream.text_stream:
                     yield text
 
-        analysis = st.write_stream(_stream())
-        render_save_export(str(analysis), ptype="vision_analysis", key_prefix="vision")
+        try:
+            analysis = st.write_stream(_stream())
+            render_save_export(str(analysis), ptype="vision_analysis", key_prefix="vision")
+        except Exception as e:
+            st.error(f"Connection error — please try again. ({e})")
