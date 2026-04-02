@@ -214,6 +214,11 @@ def render_auditor(preloaded_text: str = "") -> None:
     st.header("Protocol Auditor")
     st.caption("Paste a lab protocol and get an expert AI audit.")
 
+    # Accept protocol forwarded from the Generator
+    if not preloaded_text and st.session_state.get("preloaded_protocol"):
+        preloaded_text = st.session_state.pop("preloaded_protocol")
+        st.info("Protocol loaded from Generator.")
+
     protocol = st.text_area(
         "Protocol text",
         value=preloaded_text or DEFAULT_PROTOCOL,
@@ -340,21 +345,82 @@ def render_literature() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Feature 3 — Protocol Generator (updated with export + share)
+# Feature 3 — Protocol Generator (file upload + text prompt + send to auditor)
 # ---------------------------------------------------------------------------
+
+def _extract_text_from_file(uploaded_file) -> str:
+    """Extract plain text from PDF, Excel, or Word file."""
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+
+    if name.endswith(".pdf"):
+        try:
+            import pdfplumber, io as _io
+            text_parts = []
+            with pdfplumber.open(_io.BytesIO(raw)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text()
+                    if t:
+                        text_parts.append(t)
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            return f"[PDF parse error: {e}]"
+
+    if name.endswith((".xlsx", ".xls")):
+        try:
+            import openpyxl, io as _io
+            wb = openpyxl.load_workbook(_io.BytesIO(raw), read_only=True, data_only=True)
+            lines = []
+            for sheet in wb.worksheets:
+                lines.append(f"Sheet: {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    row_vals = [str(c) if c is not None else "" for c in row]
+                    if any(v.strip() for v in row_vals):
+                        lines.append("\t".join(row_vals))
+            return "\n".join(lines)
+        except Exception as e:
+            return f"[Excel parse error: {e}]"
+
+    if name.endswith((".docx", ".doc")):
+        try:
+            import docx as _docx, io as _io
+            doc = _docx.Document(_io.BytesIO(raw))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            return f"[Word parse error: {e}]"
+
+    return "[Unsupported file type]"
+
 
 def render_generator(preloaded_text: str = "") -> None:
     st.header("Protocol Generator")
     st.caption(
-        "Describe your experiment in plain English and get a complete, "
-        "structured lab protocol."
+        "Describe your experiment, upload supporting documents, or both. "
+        "BenchClaw will parse your files and generate a complete protocol."
     )
 
+    # File upload
+    uploaded_files = st.file_uploader(
+        "Upload vendor manuals, primer lists, notes (PDF, Excel, Word)",
+        type=["pdf", "xlsx", "xls", "docx", "doc"],
+        accept_multiple_files=True,
+        key="gen_files",
+    )
+
+    file_context = ""
+    if uploaded_files:
+        parsed_parts = []
+        for f in uploaded_files:
+            text = _extract_text_from_file(f)
+            parsed_parts.append(f"--- {f.name} ---\n{text}")
+            st.success(f"Parsed: {f.name} ({len(text):,} characters)")
+        file_context = "\n\n".join(parsed_parts)
+
     description = st.text_area(
-        "Experiment description",
-        value=preloaded_text or DEFAULT_DESCRIPTION,
-        height=180,
-        placeholder="Describe what you want to do in plain English…",
+        "Experiment description (optional if uploading files)",
+        value=preloaded_text or "",
+        height=140,
+        placeholder="Describe what you want to do, or let the uploaded files speak for themselves…",
         key="gen_input",
     )
 
@@ -373,8 +439,8 @@ def render_generator(preloaded_text: str = "") -> None:
         )
 
     if st.button("Generate Protocol", type="primary", key="gen_btn"):
-        if not description.strip():
-            st.warning("Please describe your experiment.")
+        if not description.strip() and not file_context:
+            st.warning("Please describe your experiment or upload at least one file.")
             return
 
         detail_map = {
@@ -398,6 +464,12 @@ def render_generator(preloaded_text: str = "") -> None:
             ),
         }
 
+        content_parts = []
+        if file_context:
+            content_parts.append(f"UPLOADED DOCUMENTS:\n{file_context[:12000]}")
+        if description.strip():
+            content_parts.append(f"EXPERIMENT DESCRIPTION:\n{description}")
+
         st.divider()
         st.subheader("Generated Protocol")
 
@@ -411,15 +483,22 @@ def render_generator(preloaded_text: str = "") -> None:
                     "role": "user",
                     "content": (
                         f"{detail_map[detail_level]} {format_map[output_format]}\n\n"
-                        f"EXPERIMENT DESCRIPTION:\n{description}"
+                        + "\n\n".join(content_parts)
                     ),
                 }],
             ) as stream:
                 for text in stream.text_stream:
                     yield text
 
-        protocol_text = st.write_stream(_stream())
-        render_save_export(str(protocol_text), ptype="protocol", key_prefix="gen")
+        protocol_text = str(st.write_stream(_stream()))
+        render_save_export(protocol_text, ptype="protocol", key_prefix="gen")
+
+        # Send to Auditor button
+        st.divider()
+        if st.button("Send to Protocol Auditor", key="gen_send_to_auditor"):
+            st.session_state["preloaded_protocol"] = protocol_text
+            st.session_state["nav_page"] = "Protocol Auditor"
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -466,20 +545,28 @@ def main() -> None:
 
         st.divider()
 
+        pages = [
+            "Protocol Generator",
+            "Protocol Auditor",
+            "Literature Cross-Reference",
+            "Protocol Diff & Audit",
+            "OpenTrons Export",
+            "Bench Vision",
+            "Database Search",
+            "Reagent Cost Estimator",
+            "My Protocols",
+        ]
+
+        # Allow programmatic navigation (e.g. from Generator -> Auditor)
+        nav_target = st.session_state.pop("nav_page", None)
+        default_idx = pages.index(nav_target) if nav_target in pages else 0
+
         page = st.radio(
             "Tools",
-            [
-                "Protocol Auditor",
-                "Literature Cross-Reference",
-                "Protocol Generator",
-                "Protocol Diff & Audit",
-                "Database Search",
-                "Reagent Cost Estimator",
-                "OpenTrons Export",
-                "Bench Vision",
-                "My Protocols",
-            ],
+            pages,
+            index=default_idx,
             label_visibility="collapsed",
+            key="sidebar_nav",
         )
 
         st.divider()
@@ -492,22 +579,22 @@ def main() -> None:
         )
 
     # --- Route ---
-    if page == "Protocol Auditor":
+    if page == "Protocol Generator":
+        render_generator()
+    elif page == "Protocol Auditor":
         render_auditor()
     elif page == "Literature Cross-Reference":
         render_literature()
-    elif page == "Protocol Generator":
-        render_generator()
     elif page == "Protocol Diff & Audit":
         render_diff_auditor()
-    elif page == "Database Search":
-        render_labclaw()
-    elif page == "Reagent Cost Estimator":
-        render_reagent_cost()
     elif page == "OpenTrons Export":
         render_opentrons()
     elif page == "Bench Vision":
         render_bench_vision()
+    elif page == "Database Search":
+        render_labclaw()
+    elif page == "Reagent Cost Estimator":
+        render_reagent_cost()
     elif page == "My Protocols":
         render_my_protocols()
 
