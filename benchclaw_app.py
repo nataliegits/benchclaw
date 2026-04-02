@@ -1,15 +1,24 @@
 """BenchClaw v2 — Streamlit web app for AI-powered lab protocol tools."""
 
+import json
 import os
 import sys
-import json
+
 import requests
+import streamlit as st
 import xml.etree.ElementTree as ET
 
-import streamlit as st
-import anthropic
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "labclaw", "src"))
+
+from benchclaw_db import db_create_user, db_load_by_token, db_verify_user
+from benchclaw_features import (
+    get_client,
+    render_diff_auditor,
+    render_labclaw,
+    render_my_protocols,
+    render_reagent_cost,
+    render_save_export,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -22,15 +31,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Shared client
-# ---------------------------------------------------------------------------
-@st.cache_resource
-def get_client():
-    return anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
-
-# ---------------------------------------------------------------------------
-# System prompts
+# System prompts (existing features)
 # ---------------------------------------------------------------------------
 AUDIT_SYSTEM = (
     "You are a senior molecular biology scientist with 20+ years of experience "
@@ -52,7 +53,7 @@ KEYWORD_SYSTEM = (
     "You are a scientific literature search specialist. "
     "Extract the most relevant PubMed search terms from lab protocol or "
     "experiment descriptions. Return ONLY a JSON array of 3-6 search term "
-    "strings, no explanation. Example: [\"MeDIP-seq\", \"DNA methylation immunoprecipitation\", \"5-methylcytosine antibody\"]"
+    'strings, no explanation. Example: ["MeDIP-seq", "DNA methylation immunoprecipitation", "5-methylcytosine antibody"]'
 )
 
 DEFAULT_PROTOCOL = """\
@@ -73,19 +74,150 @@ DEFAULT_DESCRIPTION = (
     "wild-type cells using whole-genome bisulfite sequencing."
 )
 
+EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
 
 # ---------------------------------------------------------------------------
-# Feature 1 — Protocol Auditor
+# Feature 6 — Auth gate
 # ---------------------------------------------------------------------------
-def render_auditor():
+
+def render_auth_gate() -> bool:
+    """Show login/register UI. Returns True if user is now logged in."""
+    st.title("BenchClaw v2")
+    st.caption("Log in to access all features, or register a new account.")
+
+    tab_login, tab_register = st.tabs(["Log In", "Register"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log In", type="primary")
+        if submitted:
+            if not username or not password:
+                st.error("Please enter username and password.")
+            else:
+                user_id, err = db_verify_user(username, password)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["logged_in"] = True
+                    st.session_state["user_id"] = user_id
+                    st.session_state["username"] = username
+                    st.rerun()
+
+    with tab_register:
+        with st.form("register_form"):
+            new_username = st.text_input("Choose a username", key="reg_username")
+            new_password = st.text_input("Choose a password", type="password", key="reg_password")
+            confirm = st.text_input("Confirm password", type="password", key="reg_confirm")
+            submitted_r = st.form_submit_button("Create Account", type="primary")
+        if submitted_r:
+            if not new_username or not new_password:
+                st.error("Username and password required.")
+            elif new_password != confirm:
+                st.error("Passwords do not match.")
+            elif len(new_password) < 6:
+                st.error("Password must be at least 6 characters.")
+            else:
+                ok, err = db_create_user(new_username, new_password)
+                if err:
+                    st.error(err)
+                else:
+                    st.success("Account created! You can now log in.")
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# PubMed helpers (Feature: Literature Cross-Reference)
+# ---------------------------------------------------------------------------
+
+def _pubmed_search(query: str, max_results: int = 8) -> list:
+    resp = requests.get(
+        f"{EUTILS_BASE}/esearch.fcgi",
+        params={"db": "pubmed", "term": query, "retmax": max_results,
+                "retmode": "json", "sort": "relevance"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("esearchresult", {}).get("idlist", [])
+
+
+def _pubmed_fetch(pmids: list) -> list:
+    if not pmids:
+        return []
+    resp = requests.get(
+        f"{EUTILS_BASE}/efetch.fcgi",
+        params={"db": "pubmed", "id": ",".join(pmids),
+                "retmode": "xml", "rettype": "abstract"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    papers = []
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError:
+        return []
+    for article in root.findall(".//PubmedArticle"):
+        pmid_el = article.find(".//PMID")
+        title_el = article.find(".//ArticleTitle")
+        abstract_el = article.find(".//AbstractText")
+        year_el = article.find(".//PubDate/Year")
+        authors = []
+        for author in article.findall(".//AuthorList/Author")[:3]:
+            last = author.findtext("LastName", "")
+            initials = author.findtext("Initials", "")
+            if last:
+                authors.append(f"{last} {initials}".strip())
+        if len(article.findall(".//AuthorList/Author")) > 3:
+            authors.append("et al.")
+        journal_el = article.find(".//Journal/Title")
+        papers.append({
+            "pmid": pmid_el.text if pmid_el is not None else "N/A",
+            "title": title_el.text if title_el is not None else "No title",
+            "abstract": abstract_el.text if abstract_el is not None else "No abstract available.",
+            "authors": ", ".join(authors) if authors else "Unknown",
+            "year": year_el.text if year_el is not None else "N/A",
+            "journal": journal_el.text if journal_el is not None else "N/A",
+        })
+    return papers
+
+
+def _extract_keywords(text: str) -> list:
+    client = get_client()
+    msg = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=256,
+        system=KEYWORD_SYSTEM,
+        messages=[{"role": "user", "content": text[:3000]}],
+    )
+    raw = msg.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:-1])
+    try:
+        kws = json.loads(raw)
+        if isinstance(kws, list):
+            return [str(k) for k in kws[:6]]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return [k.strip().strip('"') for k in raw.split(",") if k.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Feature 1 — Protocol Auditor (updated with export + share)
+# ---------------------------------------------------------------------------
+
+def render_auditor(preloaded_text: str = "") -> None:
     st.header("Protocol Auditor")
     st.caption("Paste a lab protocol and get an expert AI audit.")
 
     protocol = st.text_area(
         "Protocol text",
-        value=DEFAULT_PROTOCOL,
+        value=preloaded_text or DEFAULT_PROTOCOL,
         height=250,
         placeholder="Paste your protocol here…",
+        key="auditor_input",
     )
 
     if st.button("Audit Protocol", type="primary", key="audit_btn"):
@@ -119,111 +251,15 @@ def render_auditor():
                 for text in stream.text_stream:
                     yield text
 
-        st.write_stream(_stream())
-
-
-# ---------------------------------------------------------------------------
-# PubMed helpers
-# ---------------------------------------------------------------------------
-EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-
-
-def _pubmed_search(query: str, max_results: int = 8) -> list[str]:
-    """Return a list of PMIDs for the query."""
-    resp = requests.get(
-        f"{EUTILS_BASE}/esearch.fcgi",
-        params={
-            "db": "pubmed",
-            "term": query,
-            "retmax": max_results,
-            "retmode": "json",
-            "sort": "relevance",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("esearchresult", {}).get("idlist", [])
-
-
-def _pubmed_fetch(pmids: list[str]) -> list[dict]:
-    """Fetch paper summaries for a list of PMIDs."""
-    if not pmids:
-        return []
-    resp = requests.get(
-        f"{EUTILS_BASE}/efetch.fcgi",
-        params={
-            "db": "pubmed",
-            "id": ",".join(pmids),
-            "retmode": "xml",
-            "rettype": "abstract",
-        },
-        timeout=20,
-    )
-    resp.raise_for_status()
-
-    papers = []
-    try:
-        root = ET.fromstring(resp.text)
-    except ET.ParseError:
-        return []
-
-    for article in root.findall(".//PubmedArticle"):
-        pmid_el = article.find(".//PMID")
-        title_el = article.find(".//ArticleTitle")
-        abstract_el = article.find(".//AbstractText")
-        year_el = article.find(".//PubDate/Year")
-
-        authors = []
-        for author in article.findall(".//AuthorList/Author")[:3]:
-            last = author.findtext("LastName", "")
-            initials = author.findtext("Initials", "")
-            if last:
-                authors.append(f"{last} {initials}".strip())
-        if len(article.findall(".//AuthorList/Author")) > 3:
-            authors.append("et al.")
-
-        journal_el = article.find(".//Journal/Title")
-
-        papers.append({
-            "pmid": pmid_el.text if pmid_el is not None else "N/A",
-            "title": title_el.text if title_el is not None else "No title",
-            "abstract": abstract_el.text if abstract_el is not None else "No abstract available.",
-            "authors": ", ".join(authors) if authors else "Unknown",
-            "year": year_el.text if year_el is not None else "N/A",
-            "journal": journal_el.text if journal_el is not None else "N/A",
-        })
-
-    return papers
-
-
-def _extract_keywords(text: str) -> list[str]:
-    """Use Claude to extract PubMed search terms from protocol/description text."""
-    client = get_client()
-    msg = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=256,
-        system=KEYWORD_SYSTEM,
-        messages=[{"role": "user", "content": text[:3000]}],
-    )
-    raw = msg.content[0].text.strip()
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:-1])
-    try:
-        keywords = json.loads(raw)
-        if isinstance(keywords, list):
-            return [str(k) for k in keywords[:6]]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Fallback: split on commas
-    return [k.strip().strip('"') for k in raw.split(",") if k.strip()]
+        audit_text = st.write_stream(_stream())
+        render_save_export(str(audit_text), ptype="audit", key_prefix="audit")
 
 
 # ---------------------------------------------------------------------------
 # Feature 2 — Literature Cross-Reference
 # ---------------------------------------------------------------------------
-def render_literature():
+
+def render_literature() -> None:
     st.header("Literature Cross-Reference")
     st.caption(
         "Paste a protocol or describe an experiment — BenchClaw extracts keywords "
@@ -235,6 +271,7 @@ def render_literature():
         value=DEFAULT_PROTOCOL,
         height=200,
         placeholder="Paste your protocol or experiment description…",
+        key="lit_input",
     )
 
     col1, col2 = st.columns([1, 3])
@@ -244,6 +281,7 @@ def render_literature():
         custom_query = st.text_input(
             "Override search query (optional)",
             placeholder="Leave blank to auto-extract keywords",
+            key="lit_custom_query",
         )
 
     if st.button("Search PubMed", type="primary", key="lit_btn"):
@@ -285,30 +323,25 @@ def render_literature():
 
         st.divider()
         st.subheader(f"Found {len(papers)} paper(s)")
-
         for i, paper in enumerate(papers, 1):
-            with st.expander(
-                f"{i}. {paper['title'][:100]}{'…' if len(paper['title']) > 100 else ''}",
-                expanded=(i == 1),
-            ):
+            title_preview = paper["title"][:100] + ("…" if len(paper["title"]) > 100 else "")
+            with st.expander(f"{i}. {title_preview}", expanded=(i == 1)):
                 col_a, col_b = st.columns([2, 1])
                 with col_a:
                     st.markdown(f"**Authors:** {paper['authors']}")
                     st.markdown(f"**Journal:** {paper['journal']} ({paper['year']})")
                 with col_b:
                     pmid = paper["pmid"]
-                    st.markdown(
-                        f"**PMID:** [{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)"
-                    )
-
+                    st.markdown(f"**PMID:** [{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
                 st.markdown("**Abstract:**")
                 st.write(paper["abstract"])
 
 
 # ---------------------------------------------------------------------------
-# Feature 3 — Protocol Generator
+# Feature 3 — Protocol Generator (updated with export + share)
 # ---------------------------------------------------------------------------
-def render_generator():
+
+def render_generator(preloaded_text: str = "") -> None:
     st.header("Protocol Generator")
     st.caption(
         "Describe your experiment in plain English and get a complete, "
@@ -317,9 +350,10 @@ def render_generator():
 
     description = st.text_area(
         "Experiment description",
-        value=DEFAULT_DESCRIPTION,
+        value=preloaded_text or DEFAULT_DESCRIPTION,
         height=180,
         placeholder="Describe what you want to do in plain English…",
+        key="gen_input",
     )
 
     col1, col2 = st.columns(2)
@@ -327,13 +361,13 @@ def render_generator():
         detail_level = st.selectbox(
             "Detail level",
             ["Standard", "Highly detailed (Nature Protocols style)", "Quick overview"],
-            index=0,
+            key="gen_detail",
         )
     with col2:
         output_format = st.selectbox(
             "Output format",
             ["Step-by-step numbered list", "Markdown with sections", "Table of steps"],
-            index=0,
+            key="gen_format",
         )
 
     if st.button("Generate Protocol", type="primary", key="gen_btn"):
@@ -348,9 +382,7 @@ def render_generator():
                 "include all reagent preparations, exact volumes, equipment settings, "
                 "expected outcomes, critical steps, troubleshooting table, and timing."
             ),
-            "Quick overview": (
-                "Write a concise overview protocol with the key steps only."
-            ),
+            "Quick overview": "Write a concise overview protocol with the key steps only.",
         }
         format_map = {
             "Step-by-step numbered list": "Use a numbered list for all steps.",
@@ -364,9 +396,6 @@ def render_generator():
             ),
         }
 
-        detail_instruction = detail_map[detail_level]
-        format_instruction = format_map[output_format]
-
         st.divider()
         st.subheader("Generated Protocol")
 
@@ -379,7 +408,7 @@ def render_generator():
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"{detail_instruction} {format_instruction}\n\n"
+                        f"{detail_map[detail_level]} {format_map[output_format]}\n\n"
                         f"EXPERIMENT DESCRIPTION:\n{description}"
                     ),
                 }],
@@ -387,42 +416,92 @@ def render_generator():
                 for text in stream.text_stream:
                     yield text
 
-        st.write_stream(_stream())
+        protocol_text = st.write_stream(_stream())
+        render_save_export(str(protocol_text), ptype="protocol", key_prefix="gen")
+
+
+# ---------------------------------------------------------------------------
+# Shared protocol viewer (token-based)
+# ---------------------------------------------------------------------------
+
+def render_shared_protocol(token: str) -> None:
+    row = db_load_by_token(token)
+    if not row:
+        st.error("Protocol not found or link has expired.")
+        return
+    st.header(f"Shared Protocol: {row['title']}")
+    st.caption(f"Type: {row['ptype'].replace('_', ' ').title()}  ·  Saved: {row['created'][:10]}")
+    st.divider()
+    st.markdown(row["body"])
+    from benchclaw_features import render_save_export
+    render_save_export(row["body"], ptype=row["ptype"], key_prefix="shared")
 
 
 # ---------------------------------------------------------------------------
 # Sidebar + routing
 # ---------------------------------------------------------------------------
-def main():
-    st.sidebar.image(
-        "https://img.icons8.com/emoji/96/dna.png", width=64
-    )
-    st.sidebar.title("BenchClaw v2")
-    st.sidebar.caption("AI-powered protocol tools for life science labs")
-    st.sidebar.divider()
 
-    page = st.sidebar.radio(
-        "Tools",
-        [
-            "Protocol Auditor",
-            "Literature Cross-Reference",
-            "Protocol Generator",
-        ],
-        label_visibility="collapsed",
-    )
+def main() -> None:
+    # --- Feature 5: Check for shared protocol token in URL ---
+    token = st.query_params.get("token")
+    if token:
+        render_shared_protocol(token)
+        st.stop()
 
-    st.sidebar.divider()
-    st.sidebar.caption(
-        "Powered by [Claude API](https://www.anthropic.com) + "
-        "[PubMed E-utilities](https://www.ncbi.nlm.nih.gov/home/develop/api/)"
-    )
+    # --- Feature 6: Auth gate ---
+    if not st.session_state.get("logged_in"):
+        render_auth_gate()
+        st.stop()
 
+    # --- Sidebar ---
+    with st.sidebar:
+        st.title("BenchClaw v2")
+        st.caption(f"Logged in as **{st.session_state.get('username', '')}**")
+        if st.button("Log out", key="logout_btn"):
+            for key in ["logged_in", "user_id", "username"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+        st.divider()
+
+        page = st.radio(
+            "Tools",
+            [
+                "Protocol Auditor",
+                "Literature Cross-Reference",
+                "Protocol Generator",
+                "Protocol Diff & Audit",
+                "Database Search",
+                "Reagent Cost Estimator",
+                "My Protocols",
+            ],
+            label_visibility="collapsed",
+        )
+
+        st.divider()
+        st.caption(
+            "Powered by [Claude API](https://www.anthropic.com) · "
+            "[PubMed](https://pubmed.ncbi.nlm.nih.gov) · "
+            "[UniProt](https://www.uniprot.org) · "
+            "[ChEMBL](https://www.ebi.ac.uk/chembl) · "
+            "[PubChem](https://pubchem.ncbi.nlm.nih.gov)"
+        )
+
+    # --- Route ---
     if page == "Protocol Auditor":
         render_auditor()
     elif page == "Literature Cross-Reference":
         render_literature()
     elif page == "Protocol Generator":
         render_generator()
+    elif page == "Protocol Diff & Audit":
+        render_diff_auditor()
+    elif page == "Database Search":
+        render_labclaw()
+    elif page == "Reagent Cost Estimator":
+        render_reagent_cost()
+    elif page == "My Protocols":
+        render_my_protocols()
 
 
 if __name__ == "__main__":
