@@ -699,13 +699,21 @@ def render_opentrons() -> None:
 
         ot_code = str(st.write_stream(_stream()))
 
-        # Strip markdown code fences Claude sometimes adds (```python ... ```)
+        # Strip any prose or markdown fences Claude adds around the code.
+        # Find the first real Python line and start there.
         lines = ot_code.splitlines()
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        ot_code = "\n".join(lines)
+        start = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if (stripped.startswith(("from ", "import ", "# ", "metadata"))
+                    and not stripped.startswith("```")):
+                start = i
+                break
+        # Strip trailing fence or blank lines
+        end = len(lines)
+        while end > start and lines[end - 1].strip() in ("```", ""):
+            end -= 1
+        ot_code = "\n".join(lines[start:end])
 
         st.divider()
         col_dl, col_sim = st.columns(2)
