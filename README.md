@@ -46,8 +46,6 @@ See [audit_report.md](audit_report.md) for a full example audit of a MeDIP proto
 
 ## About
 
-Built by [Natalie Chen](https://linkedin.com/in/nychen14), Ph.D. — Head of Lab Science at Generation Lab and founder of [Experimentally.AI](https://experimentally.ai).
+Built by [Natalie Chen](https://linkedin.com/in/nychen14), Ph.D., Head of Lab Science at Generation Lab and founder of [Experimentally.AI](https://experimentally.ai).
 
 This is the software core of a larger vision: **BenchClaw** — a wearable lab capture system that passively records what scientists do at the bench and generates structured protocol documentation in real time. No more stopping to document. The hardware layer comes next.
-
-Follow the build: [benchpressed.substack.com](https://benchpressed.substack.com)
