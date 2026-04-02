@@ -20,6 +20,8 @@ A Streamlit web app with seven tools:
 | **Protocol Diff & Audit** | Paste two versions of a protocol, see a highlighted diff, get an AI audit of what changed |
 | **Database Search** | Search UniProt, ChEMBL, and PubChem directly from the app |
 | **Reagent Cost Estimator** | Extracts reagents from a protocol and returns price ranges and vendor suggestions |
+| **OpenTrons Export** | Converts any protocol to a valid OT-2 Python script, ready to run on the robot or simulator |
+| **Bench Vision** | Upload a photo from the bench — Claude identifies the technique, reads labels, and flags issues |
 | **My Protocols** | Save, share via link, and manage your protocols across sessions |
 
 ## Quick Start
@@ -30,7 +32,6 @@ cd benchclaw
 
 pip install anthropic streamlit requests python-docx fpdf2
 export ANTHROPIC_API_KEY="your-key-here"
-
 streamlit run benchclaw_app.py
 ```
 
@@ -53,9 +54,10 @@ See [audit_report.md](audit_report.md) for an example output.
 
 ## Built With
 
-- [Claude API](https://anthropic.com) (Anthropic) — scientific domain reasoning and protocol generation
+- [Claude API](https://anthropic.com) (Anthropic) — scientific reasoning, protocol generation, vision, and OT-2 code generation
 - [Streamlit](https://streamlit.io) — web app framework
 - [LabClaw](https://github.com/labclaw/labclaw) — open-source AI infrastructure for scientific labs (submodule)
+- [Opentrons Python API](https://docs.opentrons.com/v2/) — OT-2 robot protocol scripting
 - [NCBI E-utilities](https://www.ncbi.nlm.nih.gov/home/develop/api/) — PubMed search
 - [UniProt REST API](https://www.uniprot.org/help/api) — protein database
 - [ChEMBL API](https://www.ebi.ac.uk/chembl/) — bioactive molecule database

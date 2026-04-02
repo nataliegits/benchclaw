@@ -2,6 +2,63 @@
 
 ---
 
+## 2026-04-02 - OpenTrons export and Bench Vision
+
+### What I added
+
+Two features that push the app closer to the actual bench.
+
+**OpenTrons Export** converts any protocol into a valid Python script for the Opentrons OT-2 robot. You paste a protocol, pick your pipette and mount, and the app generates code you can download as a `.py` file and drag into the Opentrons App or simulator. It streams live so you watch the code being written. Each step in the generated script has a comment pointing back to the original protocol step number, and any steps that can't be automated get a `protocol.comment()` call explaining what the scientist needs to do manually.
+
+The reason this matters: the gap between "written protocol" and "robot-executable instructions" is currently manual and slow. Bridging that in one click is directly useful, and it's a strong demo moment: plain English description becomes robot code in real time.
+
+**Bench Vision** adds image upload to the app. You take a photo at the bench, upload it, and Claude describes what it sees: equipment, samples, labels, technique, anything visible. There's an optional protocol context field where you can paste the relevant protocol or say which step you're on, and Claude will tell you whether what it sees matches what should be there. There's also a free-text question field for things like "do these bands look right?" or "is this contaminated?"
+
+This is the start of the visual intelligence layer. Right now it's interpreting single images. The longer-term version is continuous: a camera at the bench feeding frames into this analysis, checked against a known protocol in real time.
+
+### How the image upload works
+
+Streamlit has a built-in `st.file_uploader()` component that accepts image files and returns the raw bytes. To send an image to Claude, you base64-encode those bytes and pass them as a content block alongside the text prompt:
+
+```python
+import base64
+
+image_bytes = uploaded_file.read()
+b64 = base64.standard_b64encode(image_bytes).decode()
+
+messages = [{
+    "role": "user",
+    "content": [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+        },
+        {
+            "type": "text",
+            "text": "What do you see in this lab image?"
+        }
+    ]
+}]
+```
+
+Claude receives both the image and the text in the same message. The `media_type` field needs to match the actual file format (jpeg, png, gif, or webp). The model used is `claude-opus-4-6`, which supports vision natively.
+
+### How the OpenTrons code generation works
+
+The Opentrons OT-2 uses Python scripts to define protocols. The structure is always the same: a metadata dictionary, then a `run()` function that takes a `protocol_api.ProtocolContext` argument. Inside that function you load labware, load pipettes, and issue liquid handling commands.
+
+Claude knows the OT-2 API well enough to generate valid scripts. The system prompt specifies the real labware names, real pipette names, and the correct API version (`2.16`). It also tells Claude to add comments mapping each generated step back to the original protocol step number, and to use `protocol.comment()` for anything that can't be automated.
+
+The output is streamed live and then available as a `.py` download. The link to the Opentrons Protocol Designer simulator is included so you can test it immediately in the browser without needing the physical robot.
+
+### What the protocol context field in Bench Vision is for
+
+This is the core of the training layer. When you upload an image and also paste in a protocol, Claude can answer questions like: "I'm on step 4, does what I see match what I should see?" That comparison between expected and observed is what makes the visual layer useful rather than just descriptive.
+
+Over time, if you run the same protocol repeatedly and upload images at each step, you're building a dataset of what each step looks like when it goes right and when it goes wrong. That's the foundation for training a model that doesn't need Claude's reasoning every time, just a fast classifier.
+
+---
+
 ## 2026-04-01 - Building v1 and v2 in one session
 
 ### What I set out to do
