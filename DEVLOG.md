@@ -2,6 +2,97 @@
 
 ---
 
+## 2026-04-02 (continued) - Getting OpenTrons export actually working
+
+### The problem with "it generates code" vs "it runs on the robot"
+
+Getting the OpenTrons export to produce a file that the Opentrons App accepts without errors took a lot more iterations than expected. The code Claude generates looks correct to the eye. Getting it to pass the app's protocol analyzer required fixing six distinct failure modes, each one only revealing itself after the previous was fixed. This is worth documenting in detail because each failure mode is instructive.
+
+---
+
+### Iteration 1: invalid syntax on line 3
+
+The first generated files came back with `invalid syntax (line 3)` from the Opentrons App.
+
+Line 3 should be `metadata = {`. That's valid Python. The issue was that Claude was wrapping its output in markdown code fences (` ```python `) despite being told not to. The fence-stripping logic I wrote was looking for the first line starting with `from`, `import`, `# `, or `metadata` and starting there. When Claude added a sentence of prose before the fence, the detector was finding the wrong line.
+
+The fix was to rewrite the fence-stripping to explicitly detect ` ``` ` boundary lines and extract the content between the first and last fence, rather than trying to guess where code starts by inspecting line prefixes.
+
+---
+
+### Iteration 2: name 'protocol_api' is not defined
+
+The error changed. Now the app was saying `name 'protocol_api' is not defined`.
+
+The generated code uses `protocol_api.ProtocolContext` in the function signature. If `from opentrons import protocol_api` is missing, that name doesn't exist. Claude was sometimes omitting the import, or generating `import opentrons` instead of the required form.
+
+Two fixes: updated the system prompt to show the exact required import line and state it must always be first, and added a code-level safety net that checks whether `from opentrons import protocol_api` is present in the final string and prepends it if not.
+
+---
+
+### Iteration 3: file truncated mid-generation
+
+The next files were syntactically invalid for a different reason: they ended abruptly mid-string. Literally ending with something like:
+
+```
+    protocol.pause('Protocol complete. Perform therm
+```
+
+The protocol I was testing was a detailed hMeDIP workflow with gel QC, fragmentation, and immunoprecipitation. Fully scripted, it runs to well over 400 lines. The `max_tokens` parameter for the streaming call was set to 4096, then 8192 -- neither was enough.
+
+Increased to 16384. Added a Python `ast.parse()` check after generation that shows an error banner in the UI if the code doesn't parse cleanly, so the problem is visible before downloading rather than after importing into the robot app.
+
+---
+
+### Iteration 4: More than one run function is defined
+
+Error: `More than one run function is defined (lines 10, 64, 213)`.
+
+Three `run` functions in the same file. This happened because the system prompt contained a code-block template showing the required structure. Claude was reproducing the template literally in the output, then generating the actual protocol below it. The template's `def run(...)` was appearing as a second or third definition.
+
+The fix was to remove all code from the system prompt and replace the template with a numbered list of prose requirements. Claude stopped including the template in its output.
+
+---
+
+### Iteration 5: OutOfTipsError
+
+The Opentrons App simulates the protocol before running it. Simulation failed with `OutOfTipsError` around line 399.
+
+The robot had three 96-well tip racks loaded: 288 tips total. The generated protocol was calling `pick_up_tip()` and `drop_tip()` on every single well interaction -- adding buffer to each of 12 wells used 12 tips, removing waste from each of 12 wells used 12 more, and the protocol had 5 wash rounds plus 2 more. Total tip usage: around 380.
+
+The rule I added to the system prompt: reuse the same tip whenever dispensing the same reagent to multiple wells (pick up once, dispense to every well inside the loop, drop once after). Same for waste removal. Use a fresh tip only when picking up different sample DNA, where cross-contamination is a real risk. With this rule, the same protocol runs in under 100 tips.
+
+---
+
+### Iteration 6: Expected tip drop target to be a tip rack
+
+One more. `AssertionError: Expected tip drop target to be a tip rack`.
+
+Claude was calling `p300.drop_tip(waste)` -- passing the waste reservoir well as an argument to `drop_tip()`. In the Opentrons API, `drop_tip()` takes no arguments and always drops into the trash. Passing any location to it is invalid.
+
+Added an explicit rule to the system prompt: `drop_tip()` takes no arguments. Never pass a location.
+
+---
+
+### Where it landed
+
+After all six fixes, the protocol loaded cleanly: deck view populated, labware placed correctly, hardware assigned. The next step was adding the Liquids and Parameters tabs, which required bumping apiLevel from 2.13 to 2.18. That adds:
+
+- **Parameters**: a required `add_parameters(parameters)` function before `run()` that exposes runtime variables (pipette mount, sample count, volumes) as UI controls in the app
+- **Liquids**: `protocol.define_liquid()` calls after labware loading that color-code each reagent in the visual deck view, each assigned a distinct hex color
+
+The system prompt now enforces both, and the file the app receives is a complete, loadable OT-2 protocol with deck view, hardware, liquids, and parameters -- generated from plain English in one click.
+
+---
+
+### What this debugging process actually shows
+
+Each error was a different layer of the problem. Syntax errors, import errors, truncation, duplicate definitions, resource limits, API misuse. None of them were obvious from looking at the generated code. Every one required understanding what the Opentrons App's analyzer actually does and why it was failing at that specific point.
+
+The useful general pattern: when an LLM is generating code for a specific runtime (robot, compiler, specialized tool), you have to iterate against the actual runtime, not just against Python syntax. The code can be valid Python and still fail the runtime's validator for reasons that have nothing to do with Python.
+
+---
+
 ## 2026-04-02 - OpenTrons export and Bench Vision
 
 ### What I added
