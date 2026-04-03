@@ -4,31 +4,26 @@
 
 ## 2026-04-02 (continued) - Getting OpenTrons export actually working
 
-### The problem with "it generates code" vs "it runs on the robot"
+Getting the OpenTrons export to produce a file that the Opentrons App accepts without errors took a lot more iterations than expected. The code Claude generates looks correct to the eye. But, getting it to pass the app's protocol analyzer required fixing six distinct failure modes, each one only revealing itself after the previous was fixed. 
 
-Getting the OpenTrons export to produce a file that the Opentrons App accepts without errors took a lot more iterations than expected. The code Claude generates looks correct to the eye. Getting it to pass the app's protocol analyzer required fixing six distinct failure modes, each one only revealing itself after the previous was fixed. This is worth documenting in detail because each failure mode is instructive.
-
----
 
 ### Iteration 1: invalid syntax on line 3
 
 The first generated files came back with `invalid syntax (line 3)` from the Opentrons App.
 
-Line 3 should be `metadata = {`. That's valid Python. The issue was that Claude was wrapping its output in markdown code fences (` ```python `) despite being told not to. The fence-stripping logic I wrote was looking for the first line starting with `from`, `import`, `# `, or `metadata` and starting there. When Claude added a sentence of prose before the fence, the detector was finding the wrong line.
+Line 3 should be `metadata = {`. The issue was that Claude was wrapping its output in markdown code fences (` ```python `). The fence-stripping logic I wrote was looking for the first line starting with `from`, `import`, `# `, or `metadata` and starting there. When Claude added a sentence of prose before the fence, the detector was finding the wrong line.
 
 The fix was to rewrite the fence-stripping to explicitly detect ` ``` ` boundary lines and extract the content between the first and last fence, rather than trying to guess where code starts by inspecting line prefixes.
 
----
 
 ### Iteration 2: name 'protocol_api' is not defined
 
-The error changed. Now the app was saying `name 'protocol_api' is not defined`.
+ Now the app was saying `name 'protocol_api' is not defined`.
 
 The generated code uses `protocol_api.ProtocolContext` in the function signature. If `from opentrons import protocol_api` is missing, that name doesn't exist. Claude was sometimes omitting the import, or generating `import opentrons` instead of the required form.
 
 Two fixes: updated the system prompt to show the exact required import line and state it must always be first, and added a code-level safety net that checks whether `from opentrons import protocol_api` is present in the final string and prepends it if not.
 
----
 
 ### Iteration 3: file truncated mid-generation
 
@@ -42,37 +37,31 @@ The protocol I was testing was a detailed hMeDIP workflow with gel QC, fragmenta
 
 Increased to 16384. Added a Python `ast.parse()` check after generation that shows an error banner in the UI if the code doesn't parse cleanly, so the problem is visible before downloading rather than after importing into the robot app.
 
----
-
 ### Iteration 4: More than one run function is defined
 
 Error: `More than one run function is defined (lines 10, 64, 213)`.
 
 Three `run` functions in the same file. This happened because the system prompt contained a code-block template showing the required structure. Claude was reproducing the template literally in the output, then generating the actual protocol below it. The template's `def run(...)` was appearing as a second or third definition.
 
-The fix was to remove all code from the system prompt and replace the template with a numbered list of prose requirements. Claude stopped including the template in its output.
+The fix was to remove all code from the system prompt and replace the template with a numbered list of prose requirements.
 
----
 
 ### Iteration 5: OutOfTipsError
 
-The Opentrons App simulates the protocol before running it. Simulation failed with `OutOfTipsError` around line 399.
+The Opentrons App simulator failed with `OutOfTipsError` around line 399.
 
-The robot had three 96-well tip racks loaded: 288 tips total. The generated protocol was calling `pick_up_tip()` and `drop_tip()` on every single well interaction -- adding buffer to each of 12 wells used 12 tips, removing waste from each of 12 wells used 12 more, and the protocol had 5 wash rounds plus 2 more. Total tip usage: around 380.
+The robot had three 96-well tip racks loaded: 288 tips total. The generated protocol was calling `pick_up_tip()` and `drop_tip()` on every single well interaction: adding buffer to each of 12 wells used 12 tips, removing waste from each of 12 wells used 12 more, and the protocol had 5 wash rounds plus 2 more. Total tip usage: around 380.
 
 The rule I added to the system prompt: reuse the same tip whenever dispensing the same reagent to multiple wells (pick up once, dispense to every well inside the loop, drop once after). Same for waste removal. Use a fresh tip only when picking up different sample DNA, where cross-contamination is a real risk. With this rule, the same protocol runs in under 100 tips.
 
----
 
 ### Iteration 6: Expected tip drop target to be a tip rack
 
-One more. `AssertionError: Expected tip drop target to be a tip rack`.
+Another OpenTrons simulation error. `AssertionError: Expected tip drop target to be a tip rack`.
 
-Claude was calling `p300.drop_tip(waste)` -- passing the waste reservoir well as an argument to `drop_tip()`. In the Opentrons API, `drop_tip()` takes no arguments and always drops into the trash. Passing any location to it is invalid.
+Claude was calling `p300.drop_tip(waste)`: passing the waste reservoir well as an argument to `drop_tip()`. In the Opentrons API, `drop_tip()` takes no arguments and always drops into the trash. Passing any location to it is invalid.
 
 Added an explicit rule to the system prompt: `drop_tip()` takes no arguments. Never pass a location.
-
----
 
 ### Where it landed
 
@@ -81,15 +70,13 @@ After all six fixes, the protocol loaded cleanly: deck view populated, labware p
 - **Parameters**: a required `add_parameters(parameters)` function before `run()` that exposes runtime variables (pipette mount, sample count, volumes) as UI controls in the app
 - **Liquids**: `protocol.define_liquid()` calls after labware loading that color-code each reagent in the visual deck view, each assigned a distinct hex color
 
-The system prompt now enforces both, and the file the app receives is a complete, loadable OT-2 protocol with deck view, hardware, liquids, and parameters -- generated from plain English in one click.
+The system prompt now enforces both, and the file the app receives is a complete, loadable OT-2 protocol with deck view, hardware, liquids, and parameters! generated from plain English in one click.
 
----
+### the debugging process overall
 
-### What this debugging process actually shows
+Each error was a different layer of the problem: Syntax, import errors, truncation, duplicate definitions, resource limits, API misuse. Every one required understanding what the Opentrons App's analyzer actually does and why it was failing at that specific point.
 
-Each error was a different layer of the problem. Syntax errors, import errors, truncation, duplicate definitions, resource limits, API misuse. None of them were obvious from looking at the generated code. Every one required understanding what the Opentrons App's analyzer actually does and why it was failing at that specific point.
-
-The useful general pattern: when an LLM is generating code for a specific runtime (robot, compiler, specialized tool), you have to iterate against the actual runtime, not just against Python syntax. The code can be valid Python and still fail the runtime's validator for reasons that have nothing to do with Python.
+The useful general pattern: when an LLM is generating code for a specific runtime (robot, compiler, specialized tool), you should  iterate against the actual runtime. code can be valid Python and still fail the runtime's validator for reasons that have nothing to do with Python.
 
 ---
 
@@ -101,11 +88,18 @@ Two features that push the app closer to the actual bench.
 
 **OpenTrons Export** converts any protocol into a valid Python script for the Opentrons OT-2 robot. You paste a protocol, pick your pipette and mount, and the app generates code you can download as a `.py` file and drag into the Opentrons App or simulator. It streams live so you watch the code being written. Each step in the generated script has a comment pointing back to the original protocol step number, and any steps that can't be automated get a `protocol.comment()` call explaining what the scientist needs to do manually.
 
-The reason this matters: the gap between "written protocol" and "robot-executable instructions" is currently manual and slow. Bridging that in one click is directly useful, and it's a strong demo moment: plain English description becomes robot code in real time.
+### How the OpenTrons code generation works
+I wanted to start bridging the gap between "written protocol" and "robot-executable instructions". 
+
+The Opentrons OT-2 uses Python scripts to define protocols. The structure is always the same: a metadata dictionary, then a `run()` function that takes a `protocol_api.ProtocolContext` argument. Inside that function you load labware, load pipettes, and issue liquid handling commands.
+
+CThe system prompt specifies the real labware names, real pipette names, and the correct API version (`2.16`). It also tells Claude to add comments mapping each generated step back to the original protocol step number, and to use `protocol.comment()` for anything that can't be automated.
+
+The output is streamed live and then available as a `.py` download. The link to the Opentrons Protocol Designer simulator is included so you can test it immediately in the browser without needing the physical robot.
 
 **Bench Vision** adds image upload to the app. You take a photo at the bench, upload it, and Claude describes what it sees: equipment, samples, labels, technique, anything visible. There's an optional protocol context field where you can paste the relevant protocol or say which step you're on, and Claude will tell you whether what it sees matches what should be there. There's also a free-text question field for things like "do these bands look right?" or "is this contaminated?"
 
-This is the start of the visual intelligence layer. Right now it's interpreting single images. The longer-term version is continuous: a camera at the bench feeding frames into this analysis, checked against a known protocol in real time.
+This is sort of a passion project of mine where maybe we can get some visual intelligence incorporated into this. Right now it's interpreting single images. The longer-term version is continuous: a camera at the bench feeding frames into this analysis, checked against a known protocol in real time.
 
 ### How the image upload works
 
@@ -134,17 +128,9 @@ messages = [{
 
 Claude receives both the image and the text in the same message. The `media_type` field needs to match the actual file format (jpeg, png, gif, or webp). The model used is `claude-opus-4-6`, which supports vision natively.
 
-### How the OpenTrons code generation works
-
-The Opentrons OT-2 uses Python scripts to define protocols. The structure is always the same: a metadata dictionary, then a `run()` function that takes a `protocol_api.ProtocolContext` argument. Inside that function you load labware, load pipettes, and issue liquid handling commands.
-
-Claude knows the OT-2 API well enough to generate valid scripts. The system prompt specifies the real labware names, real pipette names, and the correct API version (`2.16`). It also tells Claude to add comments mapping each generated step back to the original protocol step number, and to use `protocol.comment()` for anything that can't be automated.
-
-The output is streamed live and then available as a `.py` download. The link to the Opentrons Protocol Designer simulator is included so you can test it immediately in the browser without needing the physical robot.
-
 ### What the protocol context field in Bench Vision is for
 
-This is the core of the training layer. When you upload an image and also paste in a protocol, Claude can answer questions like: "I'm on step 4, does what I see match what I should see?" That comparison between expected and observed is what makes the visual layer useful rather than just descriptive.
+This is another place where I hope to bridge software into hardware. When you upload an image and also paste in a protocol, Claude can answer questions like: "I'm on step 4, does what I see match what I should see?" That comparison between expected and observed is what makes the visual layer useful rather than just descriptive.
 
 Over time, if you run the same protocol repeatedly and upload images at each step, you're building a dataset of what each step looks like when it goes right and when it goes wrong. That's the foundation for training a model that doesn't need Claude's reasoning every time, just a fast classifier.
 
@@ -188,16 +174,12 @@ The one rough patch was LabClaw. It took a while to get set up and even then I c
 
 ### Concepts I used, explained simply
 
-I used a bunch of tools and concepts I hadn't worked with before. Here's what they actually are:
+I used a bunch of tools and concepts I hadn't worked with before.
 
----
 
 #### The Anthropic SDK
 
 The Anthropic SDK is a Python library (`pip install anthropic`) that lets you send messages to Claude and get responses back. 
-
-Think of it like a phone call to Claude. You write your message, you call a function, you get a response. Under the hood it's making HTTP requests to Anthropic's servers, but the SDK makes that invisible so you don't have to deal with it.
-
 The simplest version looks like this:
 
 ```python
@@ -221,13 +203,11 @@ Three things to know:
 
 There's also a `system` parameter that sets Claude's persona and instructions before the conversation starts. That's how you tell it "you are a senior molecular biologist" and it shapes every response after that.
 
----
-
 #### Streaming
 
-When you call an API normally, you wait for the entire response before you see anything. If Claude is writing a 500-word protocol audit, you stare at a blank screen for 10 seconds and then the whole thing appears at once.
+This is something I wish I had done when building Experimentally! When you call an API normally, you wait for the entire response before you see anything. If Claude is writing a 500-word protocol audit, you stare at a blank screen for 10 seconds and then the whole thing appears at once.
 
-Streaming changes that. Instead of waiting for the whole response, you receive it word by word as it's being written, exactly like watching someone type in real time. The user sees output immediately, and long responses don't feel like they're hanging.
+With streaming, instead of waiting for the whole response, you receive it word by word as it's being written, exactly like watching someone type in real time. The user sees output immediately.
 
 In code, instead of `client.messages.create()`, you use `client.messages.stream()` with a context manager:
 
@@ -239,58 +219,46 @@ with client.messages.stream(model="claude-opus-4-6", ...) as stream:
 
 In Streamlit specifically, there's a function called `st.write_stream()` that handles all of this. You give it a generator that yields text chunks, and Streamlit renders them live on the page.
 
-Streaming is almost always the right choice for AI responses. It makes the app feel faster even when it isn't, and it prevents timeouts on long responses.
-
----
-
 #### Streamlit
 
-Streamlit is a Python library that turns a Python script into a web app. No HTML, no CSS, no JavaScript required.
+Streamlit is a Python library that turns a Python script into a web app. 
 
 Normally building a web app means writing frontend code (what the user sees) separately from backend code (the logic). Streamlit collapses that into one Python file. You write `st.text_area("Paste your protocol")` and it becomes a text input on a webpage. `st.button("Audit")` becomes a clickable button. `st.write(result)` renders the output.
 
-Every time a user interacts with the page, clicks a button, types in a box, Streamlit reruns your entire Python script from top to bottom. That's a weird mental model at first (it's not how normal web apps work) but it means the UI always reflects the current state of your code.
+Every time a user interacts with the page, clicks a button, types in a box, Streamlit reruns your entire Python script from top to bottom, so the UI always reflects the current state of your code.
 
 `st.session_state` is how you persist information across those reruns. It's a dictionary that survives the rerun cycle. That's how auth works: after login, I store `st.session_state["logged_in"] = True`, so when the script reruns it knows the user is still logged in.
 
----
 
 #### REST APIs
 
 REST APIs are how most databases and services expose their data over the internet. You send a request to a URL with some parameters, you get structured data (usually JSON) back.
-
 Example, searching PubMed for papers about MeDIP-seq:
-
 ```
 GET https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
     ?db=pubmed&term="MeDIP-seq"&retmax=5&retmode=json
 ```
-
 That returns a list of PubMed IDs. You then make a second call to fetch the actual paper details. No special library needed, just `requests.get(url, params={...})` in Python.
 
 NCBI (PubMed), UniProt, ChEMBL, and PubChem all have free REST APIs that don't require API keys for basic use. That's how the Database Search and Literature Cross-Reference features work: direct HTTP calls, no intermediary.
 
----
-
 #### SQLite
 
-SQLite is a database that lives in a single file on your computer. No server to set up, no credentials, no configuration. You just open the file and start storing data.
+SQLite is a database that lives in a single file on your computer so you just open the file and start storing data.
 
 It's used in BenchClaw for two things: storing user accounts (username, salted password hash) and storing saved protocols with share tokens. The database file is called `benchclaw.db` and gets created automatically when the app starts.
 
 The reason to use a database rather than a text file or JSON file is that it handles concurrent access safely (multiple reruns of the Streamlit script all hitting the same data without corrupting it) and lets you query by specific fields like a token or user ID.
 
----
 
-#### Why I couldn't use LabClaw's brain module directly
+#### Imitating LabClaw's brain module
 
-LabClaw has a `brain` module that wraps all the scientific database tools (including PubMed search, protein lookup, etc.). I wanted to use it directly in the app. It didn't work.
+LabClaw has a `brain` module that wraps all the scientific database tools (including PubMed search, protein lookup, etc.).
 
-The reason: LabClaw's code uses a Python feature called `StrEnum`, a type of enum that's also a string. `StrEnum` was added to Python's standard library in **Python 3.11**. The Python version running the app is **3.9**. When the app tried to import `labclaw.brain`, Python hit that line and crashed immediately.
+But, LabClaw's code uses a Python feature called `StrEnum`, a type of enum that's also a string. `StrEnum` was added to Python's standard library in **Python 3.11**. The Python version running the app is **3.9**. When the app tried to import `labclaw.brain`, Python hit that line and crashed immediately.
 
-The fix was to call the underlying databases directly via their REST APIs, which is exactly what LabClaw's wrappers do internally anyway. Same data, one less layer. It works fine, but it means the app isn't using LabClaw the way it was designed to be used. That's something to fix properly once I'm on Python 3.11+.
+So I just called the underlying databases directly via their REST APIs, which is what LabClaw's wrappers do internally anyway. It works fine, but it means the app is sort of circuitously acting as LabClaw. I can fix this properly later when I'm on Python 3.11+.
 
----
 
 ### Architecture decisions
 
@@ -311,13 +279,3 @@ User authentication libraries add dependencies and opinions about how auth shoul
 **Why are shared protocol links accessible without login?**
 
 Intentional. If I generate a protocol and want to send it to a colleague, they shouldn't have to create an account to read it. The share link is a random 16-character URL-safe token (`secrets.token_urlsafe(12)`). Knowing the token is enough to view the protocol. It's the same model GitHub uses for secret gists.
-
----
-
-### What's next
-
-The intelligence layer for images. The end goal is: I take a photo or video at the bench, feed it to the app, and BenchClaw understands what's happening. What reagent is in that tube, what step I'm on, what the gel looks like, whether the cell morphology looks right.
-
-Claude already supports image input (vision). The groundwork is the protocol and database layer I built today. Once the app understands what a correct protocol looks like, it has a baseline to compare visual observations against. That's the connection between today's work and the hardware vision.
-
-The next concrete step is building an image upload interface and prompting Claude to interpret bench photos in the context of a specific protocol.
