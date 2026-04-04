@@ -1,0 +1,8 @@
+anthropic
+streamlit
+requests
+python-docx
+fpdf2
+pdfplumber
+openpyxl
+Pillow

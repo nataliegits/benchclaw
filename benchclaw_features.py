@@ -30,7 +30,12 @@ from benchclaw_db import db_save_protocol, db_user_protocols, db_delete_protocol
 @st.cache_resource
 def get_client():
     import anthropic
-    return anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # Support both Streamlit Cloud secrets and local environment variable
+    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.error("ANTHROPIC_API_KEY not set. Add it to Streamlit secrets or your environment.")
+        st.stop()
+    return anthropic.Anthropic(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -621,20 +626,57 @@ def render_my_protocols() -> None:
 
 _OPENTRONS_SYSTEM = """\
 You are an expert Opentrons protocol engineer. Convert lab protocols into valid \
-Python scripts for the Opentrons OT-2 using protocol_api version 2.16.
+Python scripts for the Opentrons OT-2 using apiLevel 2.18.
 
-Rules:
-- Always include a metadata dict with protocolName, author, description, apiLevel '2.16'
-- Always define a run(protocol: protocol_api.ProtocolContext) function
+Every script MUST contain exactly these elements in this order, nothing else:
+1. from opentrons import protocol_api
+2. metadata dict with apiLevel '2.18'
+3. Exactly ONE add_parameters(parameters) function
+4. Exactly ONE run(protocol: protocol_api.ProtocolContext) function
+   with all liquid handling logic inside it
+
+Do not include more than one run function. Do not reproduce this structure
+description in the output.
+
+RUNTIME PARAMETERS — define in add_parameters(parameters):
+- Expose useful variables: pipette mount side, number of samples, key volumes
+- Use parameters.add_str(), parameters.add_int(), parameters.add_float(), parameters.add_bool()
+- Access inside run() via protocol.params.<variable_name>
+- CRITICAL: display_name must be 30 characters or fewer. Count carefully. Never
+  include step numbers or long descriptions in display_name. Keep it short:
+  "Pipette Mount", "Num Samples", "Wash Rounds", "Elution Volume uL"
+- Example:
+    def add_parameters(parameters):
+        parameters.add_str(
+            variable_name="mount", display_name="Pipette Mount",
+            choices=[{"display_name": "Right", "value": "right"},
+                     {"display_name": "Left", "value": "left"}],
+            default="right")
+
+LIQUIDS — define every reagent inside run() after loading labware:
+- Call protocol.define_liquid(name="...", description="...", display_color="#RRGGBB")
+- Call well.load_liquid(liquid=<var>, volume=<µL>) on every well containing that liquid
+- Use distinct colors: water=#00BFFF, buffer=#90EE90, enzyme=#FF6347,
+  antibody=#DA70D6, wash_buffer=#FFD700, DNA=#FFA500, waste=#808080
+
+Additional rules:
 - Use only real Opentrons labware names (e.g. opentrons_96_tiprack_300ul,
   corning_96_wellplate_360ul_flat, nest_12_reservoir_15ml,
   opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap)
 - Use only real pipette names (p20_single_gen2, p300_single_gen2,
   p1000_single_gen2, p20_multi_gen2, p300_multi_gen2)
-- Add comments mapping each OT-2 step to the original protocol step number
-- Where the protocol can't be fully automated, add a protocol.comment() call
-  explaining what the scientist needs to do manually
-- Output only the Python code, no explanation before or after
+- Add a comment on each step mapping it to the original protocol step number
+- Where a step cannot be automated, add protocol.comment() explaining what the
+  scientist must do manually
+- TIP REUSE IS MANDATORY to stay within 288-tip limit (3 racks × 96):
+  * Dispensing the SAME reagent to multiple wells: pick_up_tip() ONCE before
+    the loop, dispense inside the loop, drop_tip() ONCE after the loop
+  * Removing liquid to WASTE from multiple wells: pick_up_tip() ONCE, aspirate
+    each well inside the loop, drop_tip() ONCE after the loop
+  * Fresh tip only for different sample DNA (cross-contamination risk)
+  * Wash loops use at most 2 tips per round (one add, one remove)
+- Always call drop_tip() with NO arguments. Never pass a location to drop_tip().
+- Output ONLY raw Python code. No markdown fences, no explanation.
 """
 
 
@@ -680,11 +722,14 @@ def render_opentrons() -> None:
         st.divider()
         st.subheader("Generated OT-2 Script")
 
+        # Stream live to the UI and collect chunks simultaneously.
+        raw_chunks = []
+
         def _stream():
             client = get_client()
             with client.messages.stream(
                 model="claude-opus-4-6",
-                max_tokens=4096,
+                max_tokens=16384,
                 system=_OPENTRONS_SYSTEM,
                 messages=[{
                     "role": "user",
@@ -695,25 +740,59 @@ def render_opentrons() -> None:
                 }],
             ) as stream:
                 for text in stream.text_stream:
+                    raw_chunks.append(text)
                     yield text
 
-        ot_code = str(st.write_stream(_stream()))
+        st.write_stream(_stream())
+        raw = "".join(raw_chunks)
 
-        # Strip any prose or markdown fences Claude adds around the code.
-        # Find the first real Python line and start there.
-        lines = ot_code.splitlines()
-        start = 0
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if (stripped.startswith(("from ", "import ", "# ", "metadata"))
-                    and not stripped.startswith("```")):
-                start = i
-                break
-        # Strip trailing fence or blank lines
-        end = len(lines)
-        while end > start and lines[end - 1].strip() in ("```", ""):
-            end -= 1
-        ot_code = "\n".join(lines[start:end])
+        # Strip markdown fences and any surrounding prose.
+        lines = raw.splitlines()
+        fence_indices = [i for i, l in enumerate(lines) if l.strip().startswith("```")]
+        if len(fence_indices) >= 2:
+            code_lines = lines[fence_indices[0] + 1 : fence_indices[-1]]
+        elif len(fence_indices) == 1:
+            code_lines = lines[fence_indices[0] + 1 :]
+        else:
+            # No fences — skip any prose before the first Python line
+            code_lines = lines[:]
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if s.startswith(("from opentrons", "import ", "metadata", "# ")):
+                    code_lines = lines[i:]
+                    break
+
+        # Remove trailing blank lines or stray fence markers
+        while code_lines and code_lines[-1].strip() in ("```", ""):
+            code_lines = code_lines[:-1]
+
+        ot_code = "\n".join(code_lines).strip()
+
+        # Hard guarantee: first line must be the required import
+        required = "from opentrons import protocol_api"
+        if not ot_code.startswith(required):
+            # Remove any duplicate that might be further down, then prepend
+            ot_code = ot_code.replace(required, "").strip()
+            ot_code = required + "\n\n" + ot_code
+
+        # Check for truncation before showing anything
+        import ast as _ast
+        try:
+            _ast.parse(ot_code)
+            code_ok = True
+        except SyntaxError:
+            code_ok = False
+
+        if not code_ok:
+            st.error(
+                "The generated script appears to be incomplete (the protocol is very long "
+                "and hit the output limit). The code preview below is shown for reference, "
+                "but do not import it into the Opentrons App until it validates cleanly. "
+                "Try simplifying the protocol or breaking it into smaller sections."
+            )
+
+        # Show the final code so it can be inspected before downloading
+        st.code(ot_code, language="python")
 
         st.divider()
         col_dl, col_sim = st.columns(2)
